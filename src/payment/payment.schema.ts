@@ -9,6 +9,9 @@ export class DurablePayment {
   @Prop({ required: true, unique: true, index: true })
   idempotencyKey!: string;
 
+  @Prop({ required: true })
+  requestHash!: string;
+
   @Prop({ required: true, unique: true, index: true })
   orderId!: string;
 

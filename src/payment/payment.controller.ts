@@ -20,6 +20,17 @@ export class PaymentController {
     return this.paymentService.listBrokenPayments();
   }
 
+  @Post('broken/local-lock/charge')
+  chargeWithBrokenLocalLock(
+    @Body() paymentRequest: CreateBrokenPaymentDto,
+    @Headers('idempotency-key') idempotencyKey?: string,
+  ) {
+    return this.paymentService.chargeWithBrokenLocalLock(
+      paymentRequest,
+      idempotencyKey,
+    );
+  }
+
   @Post('charge')
   charge(
     @Body() paymentRequest: CreatePaymentDto,

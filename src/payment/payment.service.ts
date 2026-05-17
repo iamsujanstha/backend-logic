@@ -5,7 +5,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { Model } from 'mongoose';
 import { BrokenPaymentStore } from './broken-payment.store';
 import { CreateBrokenPaymentDto } from './dto/create-broken-payment.dto';
@@ -16,6 +16,8 @@ import { RedisLockService } from './redis-lock.service';
 
 @Injectable()
 export class PaymentService {
+  private readonly localInFlightIdempotencyKeys = new Set<string>();
+
   constructor(
     private readonly brokenPaymentStore: BrokenPaymentStore,
     private readonly redisLockService: RedisLockService,
@@ -66,6 +68,48 @@ export class PaymentService {
     return this.brokenPaymentStore.list();
   }
 
+  async chargeWithBrokenLocalLock(
+    paymentRequest: CreateBrokenPaymentDto,
+    idempotencyKey?: string,
+  ): Promise<{
+    warning: string;
+    payment: PaymentRecord;
+    receivedIdempotencyKey: string;
+  }> {
+    if (!idempotencyKey) {
+      throw new BadRequestException('Idempotency-Key header is required.');
+    }
+
+    if (this.localInFlightIdempotencyKeys.has(idempotencyKey)) {
+      throw new ConflictException(
+        'BROKEN LOCAL LOCK: this only blocks a duplicate request inside the same Node.js process.',
+      );
+    }
+
+    this.localInFlightIdempotencyKeys.add(idempotencyKey);
+
+    try {
+      await this.simulateSlowPaymentGateway();
+
+      const payment = await this.brokenPaymentStore.create({
+        ...paymentRequest,
+        status: 'charged',
+        gatewayChargeId: `gw_${randomUUID()}`,
+        idempotencyKey,
+        instanceId: this.getInstanceId(),
+      });
+
+      return {
+        warning:
+          'BROKEN: this used a process-local Set as a lock. It fails when Nginx sends duplicates to another app instance.',
+        payment,
+        receivedIdempotencyKey: idempotencyKey,
+      };
+    } finally {
+      this.localInFlightIdempotencyKeys.delete(idempotencyKey);
+    }
+  }
+
   async charge(
     paymentRequest: CreatePaymentDto,
     idempotencyKey?: string,
@@ -74,10 +118,18 @@ export class PaymentService {
       throw new BadRequestException('Idempotency-Key header is required.');
     }
 
+    const requestHash = this.createRequestHash(paymentRequest);
+
     const existingPayment = await this.paymentModel
       .findOne({ idempotencyKey })
       .lean()
       .exec();
+
+    if (existingPayment && existingPayment.requestHash !== requestHash) {
+      throw new ConflictException(
+        'Idempotency-Key was already used with a different payment payload.',
+      );
+    }
 
     if (existingPayment?.status === 'succeeded') {
       return {
@@ -113,6 +165,12 @@ export class PaymentService {
         .exec();
 
       if (paymentAfterLock?.status === 'succeeded') {
+        if (paymentAfterLock.requestHash !== requestHash) {
+          throw new ConflictException(
+            'Idempotency-Key was already used with a different payment payload.',
+          );
+        }
+
         return {
           replayed: true,
           payment: paymentAfterLock.responsePayload,
@@ -122,6 +180,7 @@ export class PaymentService {
       const processingPayment = await this.createProcessingPayment(
         paymentRequest,
         idempotencyKey,
+        requestHash,
       );
 
       const gatewayChargeId = await this.chargeGateway();
@@ -188,12 +247,14 @@ export class PaymentService {
   private async createProcessingPayment(
     paymentRequest: CreatePaymentDto,
     idempotencyKey: string,
+    requestHash: string,
   ) {
     try {
       return await this.paymentModel.create({
         ...paymentRequest,
         currency: paymentRequest.currency.toUpperCase(),
         idempotencyKey,
+        requestHash,
         status: 'processing',
         instanceId: this.getInstanceId(),
       });
@@ -218,6 +279,19 @@ export class PaymentService {
       'code' in error &&
       error.code === 11000
     );
+  }
+
+  private createRequestHash(paymentRequest: CreatePaymentDto): string {
+    const canonicalPayload = {
+      amount: paymentRequest.amount,
+      currency: paymentRequest.currency.toUpperCase(),
+      orderId: paymentRequest.orderId,
+      userId: paymentRequest.userId,
+    };
+
+    return createHash('sha256')
+      .update(JSON.stringify(canonicalPayload))
+      .digest('hex');
   }
 
   private getInstanceId(): string {

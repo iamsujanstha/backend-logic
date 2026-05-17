@@ -11,6 +11,11 @@ export class OrderController {
     return this.orderService.resetRaceDemo();
   }
 
+  @Post('n-plus-one-demo/seed')
+  seedNPlusOneDemo() {
+    return this.orderService.seedNPlusOneDemo();
+  }
+
   @Post('orders/broken/place')
   placeBrokenOrder(@Body() orderRequest: PlaceOrderDto) {
     return this.orderService.placeBrokenOrder(orderRequest);
@@ -24,5 +29,15 @@ export class OrderController {
   @Get('orders')
   listOrders() {
     return this.orderService.listOrders();
+  }
+
+  @Get('orders/broken/with-products')
+  listOrdersWithProductsBroken() {
+    return this.orderService.listOrdersWithProductsBroken();
+  }
+
+  @Get('orders/with-products')
+  listOrdersWithProducts() {
+    return this.orderService.listOrdersWithProducts();
   }
 }

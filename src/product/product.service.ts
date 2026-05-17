@@ -4,6 +4,13 @@ import { ClientSession, Model } from 'mongoose';
 import { Product } from './product.schema';
 
 export const RACE_DEMO_SKU = 'prod_race_demo';
+export const N_PLUS_ONE_DEMO_SKUS = [
+  'prod_n1_keyboard',
+  'prod_n1_mouse',
+  'prod_n1_monitor',
+  'prod_n1_dock',
+  'prod_n1_headset',
+];
 
 @Injectable()
 export class ProductService {
@@ -32,6 +39,30 @@ export class ProductService {
 
   async findBySku(sku: string) {
     return this.productModel.findOne({ sku }).exec();
+  }
+
+  async seedNPlusOneDemoProducts() {
+    const products = N_PLUS_ONE_DEMO_SKUS.map((sku, index) => ({
+      updateOne: {
+        filter: { sku },
+        update: {
+          $set: {
+            sku,
+            name: `N+1 Demo Product ${index + 1}`,
+            stock: 100,
+            priceCents: 2500 + index * 1500,
+          },
+        },
+        upsert: true,
+      },
+    }));
+
+    await this.productModel.bulkWrite(products);
+    return this.productModel
+      .find({ sku: { $in: N_PLUS_ONE_DEMO_SKUS } })
+      .sort({ sku: 1 })
+      .lean()
+      .exec();
   }
 
   async reserveStockAtomically(

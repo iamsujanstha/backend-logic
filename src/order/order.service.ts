@@ -8,7 +8,11 @@ import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { Connection, Model } from 'mongoose';
 import { PlaceOrderDto } from './dto/place-order.dto';
 import { Order } from './order.schema';
-import { ProductService, RACE_DEMO_SKU } from '../product/product.service';
+import {
+  N_PLUS_ONE_DEMO_SKUS,
+  ProductService,
+  RACE_DEMO_SKU,
+} from '../product/product.service';
 
 @Injectable()
 export class OrderService {
@@ -139,6 +143,144 @@ export class OrderService {
 
   async listOrders() {
     return this.orderModel.find().sort({ createdAt: -1 }).lean().exec();
+  }
+
+  async seedNPlusOneDemo() {
+    const products = await this.productService.seedNPlusOneDemoProducts();
+
+    await this.orderModel
+      .deleteMany({ sku: { $in: N_PLUS_ONE_DEMO_SKUS } })
+      .exec();
+
+    const orders = Array.from({ length: 30 }, (_, index) => {
+      const product = products[index % products.length];
+
+      return {
+        userId: `n1_user_${String(index + 1).padStart(2, '0')}`,
+        sku: product.sku,
+        quantity: 1,
+        status: 'confirmed',
+        unitPriceCents: product.priceCents,
+        totalCents: product.priceCents,
+        instanceId: this.getInstanceId(),
+      };
+    });
+
+    await this.orderModel.insertMany(orders);
+
+    return {
+      message: 'N+1 demo seeded with 5 products and 30 orders.',
+      productCount: products.length,
+      orderCount: orders.length,
+    };
+  }
+
+  async listOrdersWithProductsBroken() {
+    const startedAt = Date.now();
+    const orders = await this.orderModel
+      .find({ sku: { $in: N_PLUS_ONE_DEMO_SKUS } })
+      .sort({ createdAt: -1 })
+      .limit(30)
+      .lean()
+      .exec();
+
+    let productQueryCount = 0;
+    const enrichedOrders: Array<Record<string, unknown>> = [];
+
+    for (const order of orders) {
+      productQueryCount += 1;
+      const product = await this.productService.findBySku(order.sku);
+
+      enrichedOrders.push({
+        ...order,
+        product: product
+          ? {
+              sku: product.sku,
+              name: product.name,
+              priceCents: product.priceCents,
+            }
+          : null,
+      });
+    }
+
+    return {
+      warning:
+        'BROKEN: this endpoint performs one order query plus one product query per order.',
+      queryShape: '1 orders query + N product queries',
+      orderCount: orders.length,
+      productQueryCount,
+      totalMongoQueries: 1 + productQueryCount,
+      elapsedMs: Date.now() - startedAt,
+      orders: enrichedOrders,
+    };
+  }
+
+  async listOrdersWithProducts() {
+    const startedAt = Date.now();
+    const orders = await this.orderModel
+      .aggregate([
+        {
+          $match: {
+            sku: { $in: N_PLUS_ONE_DEMO_SKUS },
+          },
+        },
+        {
+          $sort: {
+            createdAt: -1,
+          },
+        },
+        {
+          $limit: 30,
+        },
+        {
+          $lookup: {
+            from: 'products',
+            localField: 'sku',
+            foreignField: 'sku',
+            as: 'product',
+          },
+        },
+        {
+          $unwind: {
+            path: '$product',
+            preserveNullAndEmptyArrays: true,
+          },
+        },
+        {
+          $project: {
+            _id: 1,
+            userId: 1,
+            sku: 1,
+            quantity: 1,
+            status: 1,
+            unitPriceCents: 1,
+            totalCents: 1,
+            instanceId: 1,
+            createdAt: 1,
+            product: {
+              sku: '$product.sku',
+              name: '$product.name',
+              priceCents: '$product.priceCents',
+            },
+          },
+        },
+      ])
+      .exec();
+
+    return {
+      message:
+        'Fixed: MongoDB aggregation loads orders and product data in one database command.',
+      queryShape: '1 aggregation pipeline with $lookup',
+      orderCount: orders.length,
+      productQueryCount: 0,
+      totalMongoQueries: 1,
+      elapsedMs: Date.now() - startedAt,
+      indexesUsedByDesign: [
+        'orders: { sku: 1, createdAt: -1 }',
+        'products: { sku: 1 } unique',
+      ],
+      orders,
+    };
   }
 
   private async simulateSlowCheckout(): Promise<void> {
