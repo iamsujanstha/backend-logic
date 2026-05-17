@@ -1,0 +1,32 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development # ◄ CRITICAL: Tells Docker to stop at the dev stage
+    # Command overrides the default to ensure NestJS runs in watch mode
+    command: npm run start:dev
+    environment:
+      - PORT=3000
+      - MONGO_URI=${MONGO_URI}
+      - REDIS_URL=${REDIS_URL}
+    networks:
+      - shared-network
+
+    develop:
+      watch:
+        # Sync local changes into the container's /app/src folder
+        - path: ./src
+          action: sync
+          target: /app/src # ◄ Matches the WORKDIR /app in your Dockerfile
+          ignore:
+            - node_modules/
+
+        - path: ./package.json
+          action: rebuild
+        - path: ./package-lock.json
+          action: rebuild
+
+networks:
+  shared-network:
+    external: true
