@@ -1,0 +1,47 @@
+services:
+  app:
+    environment:
+      - MONGO_URI=mongodb://mongo-rs:27017/backend_mastery?replicaSet=rs0&retryWrites=false
+
+  mongo-rs:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_rs_data:/data/db
+    networks:
+      - shared-network
+
+  mongo-rs-init:
+    image: mongo:7
+    depends_on:
+      - mongo-rs
+    restart: "no"
+    entrypoint:
+      - bash
+      - -lc
+      - |
+        until mongosh --host mongo-rs:27017 --quiet --eval 'db.adminCommand({ ping: 1 }).ok'; do
+          sleep 1
+        done
+
+        mongosh --host mongo-rs:27017 --quiet --eval '
+          try {
+            rs.status().ok
+          } catch (error) {
+            rs.initiate({
+              _id: "rs0",
+              members: [{ _id: 0, host: "mongo-rs:27017" }]
+            })
+          }
+        '
+    networks:
+      - shared-network
+
+networks:
+  shared-network:
+    external: true
+
+volumes:
+  mongo_rs_data:

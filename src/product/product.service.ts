@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { ClientSession, Model } from 'mongoose';
 import { Product } from './product.schema';
 
 export const RACE_DEMO_SKU = 'prod_race_demo';
@@ -24,7 +24,7 @@ export class ProductService {
             priceCents: 12900,
           },
         },
-        { new: true, upsert: true },
+        { returnDocument: 'after', upsert: true },
       )
       .lean()
       .exec();
@@ -32,6 +32,28 @@ export class ProductService {
 
   async findBySku(sku: string) {
     return this.productModel.findOne({ sku }).exec();
+  }
+
+  async reserveStockAtomically(
+    sku: string,
+    quantity: number,
+    session?: ClientSession,
+  ) {
+    return this.productModel
+      .findOneAndUpdate(
+        {
+          sku,
+          stock: { $gte: quantity },
+        },
+        {
+          $inc: { stock: -quantity },
+        },
+        {
+          returnDocument: 'after',
+          session,
+        },
+      )
+      .exec();
   }
 
   async listProducts() {

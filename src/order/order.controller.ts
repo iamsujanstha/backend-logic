@@ -16,6 +16,11 @@ export class OrderController {
     return this.orderService.placeBrokenOrder(orderRequest);
   }
 
+  @Post('orders/place')
+  placeOrder(@Body() orderRequest: PlaceOrderDto) {
+    return this.orderService.placeOrder(orderRequest);
+  }
+
   @Get('orders')
   listOrders() {
     return this.orderService.listOrders();
