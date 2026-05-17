@@ -5,6 +5,7 @@ import { join } from 'path';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { CacheModule } from './cache/cache.module';
+import { DiagnosticsModule } from './diagnostics/diagnostics.module';
 import { CpuModule } from './cpu/cpu.module';
 import { OrderModule } from './order/order.module';
 import { PaymentModule } from './payment/payment.module';
@@ -26,6 +27,7 @@ import { QueueModule } from './queue/queue.module';
     ProductModule,
     OrderModule,
     CpuModule,
+    DiagnosticsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -37,6 +37,14 @@ export class RedisCacheService implements OnModuleDestroy {
     await this.redis.del(key);
   }
 
+  async increment(key: string): Promise<number> {
+    return this.redis.incr(key);
+  }
+
+  async getString(key: string): Promise<string | null> {
+    return this.redis.get(key);
+  }
+
   async onModuleDestroy(): Promise<void> {
     this.redis.disconnect();
   }
