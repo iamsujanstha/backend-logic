@@ -8,8 +8,31 @@ services:
     command: npm run start:dev
     environment:
       - PORT=3000
-      - MONGO_URI=${MONGO_URI}
+      - DATABASE_URL=postgres://backend:backend@postgres:5432/backend_mastery
       - REDIS_URL=${REDIS_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - shared-network
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: backend
+      POSTGRES_PASSWORD: backend
+      POSTGRES_DB: backend_mastery
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U backend -d backend_mastery"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     networks:
       - shared-network
 
@@ -30,3 +53,6 @@ services:
 networks:
   shared-network:
     external: true
+
+volumes:
+  postgres_data:

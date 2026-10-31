@@ -1,13 +1,12 @@
 import {
   BadRequestException,
+  Inject,
   Injectable,
   NotFoundException,
-  ServiceUnavailableException,
 } from '@nestjs/common';
-import { InjectConnection, InjectModel } from '@nestjs/mongoose';
-import { Connection, Model } from 'mongoose';
+import { Pool } from 'pg';
+import { PG_POOL } from '../database/database.module';
 import { PlaceOrderDto } from './dto/place-order.dto';
-import { Order } from './order.schema';
 import {
   N_PLUS_ONE_DEMO_SKUS,
   ProductService,
@@ -18,15 +17,13 @@ import {
 export class OrderService {
   constructor(
     private readonly productService: ProductService,
-    @InjectConnection()
-    private readonly connection: Connection,
-    @InjectModel(Order.name)
-    private readonly orderModel: Model<Order>,
+    @Inject(PG_POOL)
+    private readonly pool: Pool,
   ) {}
 
   async resetRaceDemo() {
     const product = await this.productService.resetRaceDemoProduct();
-    await this.orderModel.deleteMany({ sku: RACE_DEMO_SKU }).exec();
+    await this.pool.query('DELETE FROM orders WHERE sku = $1', [RACE_DEMO_SKU]);
 
     return {
       message: 'Race demo reset. Product stock is 1 and related demo orders were removed.',
@@ -49,124 +46,138 @@ export class OrderService {
 
     await this.simulateSlowCheckout();
 
-    product.stock = product.stock - orderRequest.quantity;
-    await product.save();
+    const { rows: [updatedProduct] } = await this.pool.query(
+      'UPDATE products SET stock = stock - $1 WHERE sku = $2 RETURNING stock',
+      [orderRequest.quantity, orderRequest.sku],
+    );
 
-    const order = await this.orderModel.create({
-      userId: orderRequest.userId,
-      sku: product.sku,
-      quantity: orderRequest.quantity,
-      status: 'confirmed',
-      unitPriceCents: product.priceCents,
-      totalCents: product.priceCents * orderRequest.quantity,
-      instanceId: this.getInstanceId(),
-    });
+    const { rows: [order] } = await this.pool.query(
+      `INSERT INTO orders (user_id, sku, quantity, status, unit_price_cents, total_cents, instance_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [
+        orderRequest.userId,
+        product.sku,
+        orderRequest.quantity,
+        'confirmed',
+        product.price_cents,
+        product.price_cents * orderRequest.quantity,
+        this.getInstanceId(),
+      ],
+    );
 
     return {
       warning:
         'BROKEN: stock was checked before a slow checkout window and then saved non-atomically.',
       order,
-      remainingStock: product.stock,
+      remainingStock: updatedProduct.stock,
     };
   }
 
   async placeOrder(orderRequest: PlaceOrderDto) {
     this.assertValidOrderRequest(orderRequest);
 
-    const session = await this.connection.startSession();
-    let response:
-      | {
-          message: string;
-          order: Order;
-          remainingStock: number;
-        }
-      | undefined;
-
+    const client = await this.pool.connect();
     try {
-      await session.withTransaction(async () => {
-        const product = await this.productService.reserveStockAtomically(
-          orderRequest.sku,
+      await client.query('BEGIN');
+
+      const product = await this.productService.reserveStockAtomically(
+        orderRequest.sku,
+        orderRequest.quantity,
+        client,
+      );
+
+      if (!product) {
+        await client.query('ROLLBACK');
+        throw new BadRequestException('Insufficient stock.');
+      }
+
+      await this.simulateSlowCheckout();
+
+      const { rows: [order] } = await client.query(
+        `INSERT INTO orders (user_id, sku, quantity, status, unit_price_cents, total_cents, instance_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [
+          orderRequest.userId,
+          product.sku,
           orderRequest.quantity,
-          session,
-        );
+          'confirmed',
+          product.price_cents,
+          product.price_cents * orderRequest.quantity,
+          this.getInstanceId(),
+        ],
+      );
 
-        if (!product) {
-          throw new BadRequestException('Insufficient stock.');
-        }
+      await client.query('COMMIT');
 
-        await this.simulateSlowCheckout();
-
-        const [order] = await this.orderModel.create(
-          [
-            {
-              userId: orderRequest.userId,
-              sku: product.sku,
-              quantity: orderRequest.quantity,
-              status: 'confirmed',
-              unitPriceCents: product.priceCents,
-              totalCents: product.priceCents * orderRequest.quantity,
-              instanceId: this.getInstanceId(),
-            },
-          ],
-          { session },
-        );
-
-        response = {
-          message:
-            'Order confirmed. Stock decrement and order creation committed together.',
-          order,
-          remainingStock: product.stock,
-        };
-      });
+      return {
+        message:
+          'Order confirmed. Stock decrement and order creation committed together.',
+        order,
+        remainingStock: product.stock,
+      };
     } catch (error) {
-      if (error instanceof BadRequestException) {
-        throw error;
-      }
-
-      if (this.isTransactionUnsupportedError(error)) {
-        throw new ServiceUnavailableException(
-          'MongoDB transactions require a replica set. Configure MongoDB as a replica set or use a transaction-capable cluster.',
-        );
-      }
-
+      await client.query('ROLLBACK');
       throw error;
     } finally {
-      await session.endSession();
+      client.release();
     }
-
-    if (!response) {
-      throw new ServiceUnavailableException('Order transaction did not complete.');
-    }
-
-    return response;
   }
 
   async listOrders() {
-    return this.orderModel.find().sort({ createdAt: -1 }).lean().exec();
+    const { rows } = await this.pool.query(
+      'SELECT * FROM orders ORDER BY created_at DESC',
+    );
+    return rows;
   }
 
   async seedNPlusOneDemo() {
     const products = await this.productService.seedNPlusOneDemoProducts();
 
-    await this.orderModel
-      .deleteMany({ sku: { $in: N_PLUS_ONE_DEMO_SKUS } })
-      .exec();
+    await this.pool.query('DELETE FROM orders WHERE sku = ANY($1)', [
+      N_PLUS_ONE_DEMO_SKUS,
+    ]);
 
     const orders = Array.from({ length: 30 }, (_, index) => {
       const product = products[index % products.length];
-
       return {
         userId: `n1_user_${String(index + 1).padStart(2, '0')}`,
         sku: product.sku,
         quantity: 1,
         status: 'confirmed',
-        unitPriceCents: product.priceCents,
-        totalCents: product.priceCents,
+        unitPriceCents: product.price_cents,
+        totalCents: product.price_cents,
         instanceId: this.getInstanceId(),
       };
     });
 
-    await this.orderModel.insertMany(orders);
+    // Batch INSERT with parameterized values
+    const valuesClauses: string[] = [];
+    const params: unknown[] = [];
+    let paramIndex = 1;
+
+    for (const o of orders) {
+      valuesClauses.push(
+        `($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3}, $${paramIndex + 4}, $${paramIndex + 5}, $${paramIndex + 6})`,
+      );
+      params.push(
+        o.userId,
+        o.sku,
+        o.quantity,
+        o.status,
+        o.unitPriceCents,
+        o.totalCents,
+        o.instanceId,
+      );
+      paramIndex += 7;
+    }
+
+    await this.pool.query(
+      `INSERT INTO orders (user_id, sku, quantity, status, unit_price_cents, total_cents, instance_id)
+       VALUES ${valuesClauses.join(', ')}`,
+      params,
+    );
 
     return {
       message: 'N+1 demo seeded with 5 products and 30 orders.',
@@ -177,12 +188,10 @@ export class OrderService {
 
   async listOrdersWithProductsBroken() {
     const startedAt = Date.now();
-    const orders = await this.orderModel
-      .find({ sku: { $in: N_PLUS_ONE_DEMO_SKUS } })
-      .sort({ createdAt: -1 })
-      .limit(30)
-      .lean()
-      .exec();
+    const { rows: orders } = await this.pool.query(
+      'SELECT * FROM orders WHERE sku = ANY($1) ORDER BY created_at DESC LIMIT 30',
+      [N_PLUS_ONE_DEMO_SKUS],
+    );
 
     let productQueryCount = 0;
     const enrichedOrders: Array<Record<string, unknown>> = [];
@@ -197,7 +206,7 @@ export class OrderService {
           ? {
               sku: product.sku,
               name: product.name,
-              priceCents: product.priceCents,
+              priceCents: product.price_cents,
             }
           : null,
       });
@@ -209,7 +218,7 @@ export class OrderService {
       queryShape: '1 orders query + N product queries',
       orderCount: orders.length,
       productQueryCount,
-      totalMongoQueries: 1 + productQueryCount,
+      totalQueries: 1 + productQueryCount,
       elapsedMs: Date.now() - startedAt,
       orders: enrichedOrders,
     };
@@ -217,67 +226,27 @@ export class OrderService {
 
   async listOrdersWithProducts() {
     const startedAt = Date.now();
-    const orders = await this.orderModel
-      .aggregate([
-        {
-          $match: {
-            sku: { $in: N_PLUS_ONE_DEMO_SKUS },
-          },
-        },
-        {
-          $sort: {
-            createdAt: -1,
-          },
-        },
-        {
-          $limit: 30,
-        },
-        {
-          $lookup: {
-            from: 'products',
-            localField: 'sku',
-            foreignField: 'sku',
-            as: 'product',
-          },
-        },
-        {
-          $unwind: {
-            path: '$product',
-            preserveNullAndEmptyArrays: true,
-          },
-        },
-        {
-          $project: {
-            _id: 1,
-            userId: 1,
-            sku: 1,
-            quantity: 1,
-            status: 1,
-            unitPriceCents: 1,
-            totalCents: 1,
-            instanceId: 1,
-            createdAt: 1,
-            product: {
-              sku: '$product.sku',
-              name: '$product.name',
-              priceCents: '$product.priceCents',
-            },
-          },
-        },
-      ])
-      .exec();
+    const { rows: orders } = await this.pool.query(
+      `SELECT o.*, json_build_object('sku', p.sku, 'name', p.name, 'price_cents', p.price_cents) AS product
+       FROM orders o
+       LEFT JOIN products p ON o.sku = p.sku
+       WHERE o.sku = ANY($1)
+       ORDER BY o.created_at DESC
+       LIMIT 30`,
+      [N_PLUS_ONE_DEMO_SKUS],
+    );
 
     return {
       message:
-        'Fixed: MongoDB aggregation loads orders and product data in one database command.',
-      queryShape: '1 aggregation pipeline with $lookup',
+        'Fixed: SQL JOIN loads orders and product data in a single query.',
+      queryShape: '1 SELECT with LEFT JOIN',
       orderCount: orders.length,
       productQueryCount: 0,
-      totalMongoQueries: 1,
+      totalQueries: 1,
       elapsedMs: Date.now() - startedAt,
       indexesUsedByDesign: [
-        'orders: { sku: 1, createdAt: -1 }',
-        'products: { sku: 1 } unique',
+        'orders: (sku, created_at DESC)',
+        'products: sku PRIMARY KEY',
       ],
       orders,
     };
@@ -295,34 +264,6 @@ export class OrderService {
     if (!Number.isInteger(orderRequest.quantity) || orderRequest.quantity < 1) {
       throw new BadRequestException('quantity must be a positive integer.');
     }
-  }
-
-  private isTransactionUnsupportedError(error: unknown): boolean {
-    const message = this.flattenErrorMessages(error);
-
-    return (
-      message.includes('Transaction numbers are only allowed') ||
-      message.includes('replica set member or mongos') ||
-      message.includes('does not support retryable writes')
-    );
-  }
-
-  private flattenErrorMessages(error: unknown): string {
-    if (error instanceof Error) {
-      return `${error.message} ${this.flattenErrorMessages(
-        (error as Error & { originalError?: unknown }).originalError,
-      )} ${this.flattenErrorMessages(
-        (error as Error & { errorResponse?: unknown }).errorResponse,
-      )}`;
-    }
-
-    if (typeof error === 'object' && error !== null) {
-      return Object.values(error)
-        .map((value) => this.flattenErrorMessages(value))
-        .join(' ');
-    }
-
-    return typeof error === 'string' ? error : '';
   }
 
   private getInstanceId(): string {

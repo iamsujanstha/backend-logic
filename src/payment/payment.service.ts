@@ -1,17 +1,17 @@
 import {
   BadRequestException,
   ConflictException,
+  Inject,
   Injectable,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
 import { createHash, randomUUID } from 'crypto';
-import { Model } from 'mongoose';
+import { Pool } from 'pg';
 import { BrokenPaymentStore } from './broken-payment.store';
 import { CreateBrokenPaymentDto } from './dto/create-broken-payment.dto';
 import { CreatePaymentDto } from './dto/create-payment.dto';
 import { PaymentRecord } from './payment-record';
-import { DurablePayment } from './payment.schema';
+import { PG_POOL } from '../database/database.module';
 import { RedisLockService } from './redis-lock.service';
 
 @Injectable()
@@ -21,8 +21,8 @@ export class PaymentService {
   constructor(
     private readonly brokenPaymentStore: BrokenPaymentStore,
     private readonly redisLockService: RedisLockService,
-    @InjectModel(DurablePayment.name)
-    private readonly paymentModel: Model<DurablePayment>,
+    @Inject(PG_POOL)
+    private readonly pool: Pool,
   ) { }
 
   async chargeBroken(
@@ -120,12 +120,13 @@ export class PaymentService {
 
     const requestHash = this.createRequestHash(paymentRequest);
 
-    const existingPayment = await this.paymentModel
-      .findOne({ idempotencyKey })
-      .lean()
-      .exec();
+    const { rows: existingRows } = await this.pool.query(
+      'SELECT * FROM payments WHERE idempotency_key = $1',
+      [idempotencyKey],
+    );
+    const existingPayment = existingRows[0] ?? null;
 
-    if (existingPayment && existingPayment.requestHash !== requestHash) {
+    if (existingPayment && existingPayment.request_hash !== requestHash) {
       throw new ConflictException(
         'Idempotency-Key was already used with a different payment payload.',
       );
@@ -134,7 +135,7 @@ export class PaymentService {
     if (existingPayment?.status === 'succeeded') {
       return {
         replayed: true,
-        payment: existingPayment.responsePayload,
+        payment: existingPayment.response_payload,
       };
     }
 
@@ -159,13 +160,14 @@ export class PaymentService {
     }
 
     try {
-      const paymentAfterLock = await this.paymentModel
-        .findOne({ idempotencyKey })
-        .lean()
-        .exec();
+      const { rows: afterLockRows } = await this.pool.query(
+        'SELECT * FROM payments WHERE idempotency_key = $1',
+        [idempotencyKey],
+      );
+      const paymentAfterLock = afterLockRows[0] ?? null;
 
       if (paymentAfterLock?.status === 'succeeded') {
-        if (paymentAfterLock.requestHash !== requestHash) {
+        if (paymentAfterLock.request_hash !== requestHash) {
           throw new ConflictException(
             'Idempotency-Key was already used with a different payment payload.',
           );
@@ -173,7 +175,7 @@ export class PaymentService {
 
         return {
           replayed: true,
-          payment: paymentAfterLock.responsePayload,
+          payment: paymentAfterLock.response_payload,
         };
       }
 
@@ -185,9 +187,9 @@ export class PaymentService {
 
       const gatewayChargeId = await this.chargeGateway();
       const responsePayload = {
-        id: processingPayment._id.toString(),
-        orderId: processingPayment.orderId,
-        userId: processingPayment.userId,
+        id: processingPayment.id,
+        orderId: processingPayment.order_id,
+        userId: processingPayment.user_id,
         amount: processingPayment.amount,
         currency: processingPayment.currency,
         status: 'succeeded',
@@ -196,15 +198,14 @@ export class PaymentService {
         instanceId: this.getInstanceId(),
       };
 
-      await this.paymentModel.updateOne(
-        { _id: processingPayment._id },
-        {
-          $set: {
-            status: 'succeeded',
-            gatewayChargeId,
-            responsePayload,
-          },
-        },
+      await this.pool.query(
+        'UPDATE payments SET status = $1, gateway_charge_id = $2, response_payload = $3 WHERE id = $4',
+        [
+          'succeeded',
+          gatewayChargeId,
+          JSON.stringify(responsePayload),
+          processingPayment.id,
+        ],
       );
 
       return {
@@ -213,15 +214,16 @@ export class PaymentService {
       };
     } catch (error) {
       if (this.isDuplicateKeyError(error)) {
-        const existing = await this.paymentModel
-          .findOne({ idempotencyKey })
-          .lean()
-          .exec();
+        const { rows: fallbackRows } = await this.pool.query(
+          'SELECT * FROM payments WHERE idempotency_key = $1',
+          [idempotencyKey],
+        );
+        const existing = fallbackRows[0] ?? null;
 
         if (existing?.status === 'succeeded') {
           return {
             replayed: true,
-            payment: existing.responsePayload,
+            payment: existing.response_payload,
           };
         }
 
@@ -237,7 +239,10 @@ export class PaymentService {
   }
 
   async listPayments() {
-    return this.paymentModel.find().sort({ createdAt: -1 }).lean().exec();
+    const { rows } = await this.pool.query(
+      'SELECT * FROM payments ORDER BY created_at DESC',
+    );
+    return rows;
   }
 
   private async simulateSlowPaymentGateway(): Promise<void> {
@@ -250,14 +255,22 @@ export class PaymentService {
     requestHash: string,
   ) {
     try {
-      return await this.paymentModel.create({
-        ...paymentRequest,
-        currency: paymentRequest.currency.toUpperCase(),
-        idempotencyKey,
-        requestHash,
-        status: 'processing',
-        instanceId: this.getInstanceId(),
-      });
+      const { rows } = await this.pool.query(
+        `INSERT INTO payments (idempotency_key, request_hash, order_id, user_id, amount, currency, status, instance_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *`,
+        [
+          idempotencyKey,
+          requestHash,
+          paymentRequest.orderId,
+          paymentRequest.userId,
+          paymentRequest.amount,
+          paymentRequest.currency.toUpperCase(),
+          'processing',
+          this.getInstanceId(),
+        ],
+      );
+      return rows[0];
     } catch (error) {
       if (this.isDuplicateKeyError(error)) {
         throw error;
@@ -277,7 +290,7 @@ export class PaymentService {
       typeof error === 'object' &&
       error !== null &&
       'code' in error &&
-      error.code === 11000
+      (error as { code: string }).code === '23505'
     );
   }
 

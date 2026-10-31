@@ -6,7 +6,7 @@ services:
       target: development
     command: npm run start:dev -- --entryFile worker
     environment:
-      - MONGO_URI=${MONGO_URI}
+      - DATABASE_URL=postgres://backend:backend@postgres:5432/backend_mastery
       - REDIS_URL=${REDIS_URL}
     networks:
       - shared-network

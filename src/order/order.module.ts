@@ -1,16 +1,20 @@
+import { BullModule } from '@nestjs/bullmq';
 import { Module } from '@nestjs/common';
-import { MongooseModule } from '@nestjs/mongoose';
 import { OrderController } from './order.controller';
-import { Order, OrderSchema } from './order.schema';
 import { OrderService } from './order.service';
+import { OrderOutboxDemoController } from './order-outbox-demo.controller';
+import { OrderOutboxDemoService } from './order-outbox-demo.service';
 import { ProductModule } from '../product/product.module';
 
 @Module({
   imports: [
     ProductModule,
-    MongooseModule.forFeature([{ name: Order.name, schema: OrderSchema }]),
+    BullModule.registerQueue({
+      name: 'fulfillment',
+    }),
   ],
-  controllers: [OrderController],
-  providers: [OrderService],
+  controllers: [OrderController, OrderOutboxDemoController],
+  providers: [OrderService, OrderOutboxDemoService],
+  exports: [OrderService],
 })
-export class OrderModule {}
+export class OrderModule { }
