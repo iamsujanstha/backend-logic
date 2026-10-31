@@ -1,10 +1,10 @@
-# 04 - N+1 Query Problem in MongoDB
+# 04 — N+1 Query Problem in PostgreSQL
 
 ## Phase Status
 
-This phase contains both the broken N+1 implementation and the production-grade aggregation fix.
+This phase contains both the broken N+1 implementation and the production-grade SQL `JOIN` with relational JSON aggregation (`json_build_object`).
 
-## Updated Folder Structure
+## Folder Structure
 
 ```text
 src/
@@ -12,289 +12,156 @@ src/
     product.service.ts
   order/
     order.controller.ts
-    order.service.ts
+    order.service.ts         <-- Broken loop vs SQL JOIN implementation
+db/
+  init/
+    001_schema.sql           <-- orders & products tables with B-Tree indexes
 docs/
   04-n-plus-one.md
 ```
+
+---
 
 ## Problem Scenario
 
 The orders dashboard is fast during development. A developer tests it with three orders and everything looks fine.
 
-Then production grows. The dashboard loads 30, 100, or 500 orders. For every order row, the API fetches the product separately. One request quietly becomes many database round trips.
+Then production grows. The dashboard loads 30, 100, or 500 orders. For every order row, the API queries the product separately in a loop. One request quietly becomes many database round trips ($1 + N$).
 
-Real outcome: slow dashboard, MongoDB connection pool pressure, noisy query logs, and API latency that grows linearly with page size.
+**Real outcome:** Slow dashboard, PostgreSQL connection pool saturation, noisy query logs, high network latency, and API response times that scale linearly with page size ($O(N)$).
+
+---
 
 ## Broken Implementation (Code)
 
 Seed demo data:
-
-```http
-POST /n-plus-one-demo/seed
+```bash
+curl -X POST http://localhost:3000/n-plus-one-demo/seed
 ```
 
 Broken endpoint:
-
-```http
-GET /orders/broken/with-products
-```
-
-The flaw lives in:
-
-```text
-src/order/order.service.ts
-```
-
-Broken flow:
-
-```text
-GET /orders/broken/with-products
-  |
-  v
-query orders once
-  |
-  v
-for each order:
-  query product by sku
-  query product by sku
-  query product by sku
-  ...
-```
-
-For 30 orders, the endpoint performs:
-
-```text
-1 orders query + 30 product queries = 31 MongoDB queries
-```
-
-## Failure Simulation
-
-Use your active app port:
-
 ```bash
-export API_BASE=http://localhost:8080
+curl -s http://localhost:3000/orders/broken/with-products
 ```
 
-Seed the demo:
+The flaw lives in `src/order/order.service.ts`:
 
-```bash
-curl -s -X POST "$API_BASE/n-plus-one-demo/seed"
-```
+```ts
+// Flaw: 1 initial query to get orders
+const { rows: orders } = await this.pool.query(
+  'SELECT * FROM orders WHERE sku = ANY($1) ORDER BY created_at DESC LIMIT 30',
+  [N_PLUS_ONE_DEMO_SKUS],
+);
 
-Call the broken endpoint:
-
-```bash
-curl -s "$API_BASE/orders/broken/with-products"
-```
-
-Expected failure signals in the response:
-
-```json
-{
-  "queryShape": "1 orders query + N product queries",
-  "orderCount": 30,
-  "productQueryCount": 30,
-  "totalMongoQueries": 31
+// Flaw: N queries inside a JavaScript for-loop across the network
+for (const order of orders) {
+  const product = await this.productService.findBySku(order.sku); // Executes SELECT * FROM products WHERE sku = $1
+  enrichedOrders.push({ ...order, product });
 }
 ```
 
-Run it a few times. The query count is deterministic even if the elapsed time varies.
-
-## Think
-
-Before we fix it:
-
-1. Why does this look harmless with only three orders?
-2. Why does latency grow as page size grows?
-3. Why is this especially dangerous under concurrent dashboard traffic?
-4. Why are repeated products still fetched repeatedly?
-5. What MongoDB tool could fetch orders and product data in one database-side pipeline?
-
-## Step-by-Step Fix
-
-### Step 1 - Stop Querying Products Inside a Loop
-
-The broken endpoint does this:
+### Broken Flow
 
 ```text
-orders = find orders
-for order in orders:
-  product = find product by sku
+Client -> GET /orders/broken/with-products
+  -> Query 1: SELECT * FROM orders ... (returns 30 rows)
+  -> Query 2: SELECT * FROM products WHERE sku = 'prod_1'
+  -> Query 3: SELECT * FROM products WHERE sku = 'prod_2'
+  ...
+  -> Query 31: SELECT * FROM products WHERE sku = 'prod_30'
+Total queries = 1 + 30 = 31 round trips over the TCP socket!
 ```
 
-The fixed endpoint moves the relationship lookup into MongoDB:
+---
+
+## Step-by-Step Fix (Production Architecture)
+
+### Step 1 — Move the Relationship Lookup into PostgreSQL
+Instead of round-tripping across TCP 30 times, have the PostgreSQL query planner perform an indexed join close to the disk:
 
 ```http
 GET /orders/with-products
 ```
 
-### Step 2 - Use an Aggregation Pipeline
+### Step 2 — Single Roundtrip SQL JOIN with `json_build_object`
+The fixed query in `src/order/order.service.ts`:
 
-The fixed route uses:
-
-```text
-$match   only demo SKUs
-$sort    newest orders first
-$limit   cap the page size
-$lookup  join products by sku
-$unwind  convert product array into one object
-$project return only needed fields
+```sql
+SELECT 
+  o.id,
+  o.user_id,
+  o.sku,
+  o.quantity,
+  o.status,
+  o.unit_price_cents,
+  o.total_cents,
+  o.instance_id,
+  o.created_at,
+  json_build_object(
+    'sku', p.sku,
+    'name', p.name,
+    'priceCents', p.price_cents
+  ) AS product
+FROM orders o
+LEFT JOIN products p ON o.sku = p.sku
+WHERE o.sku = ANY($1)
+ORDER BY o.created_at DESC
+LIMIT 30;
 ```
 
-This changes the query shape from:
+This transforms the performance characteristics:
+- **Round trips:** Reduced from $1 + N$ to **1 single database round trip**.
+- **Data shaping:** PostgreSQL natively packages the related product data as a nested JSON object (`json_build_object`), eliminating in-memory JavaScript mapping.
 
-```text
-1 + N round trips
+### Step 3 — B-Tree Indexes for the Access Pattern
+The database schema (`db/init/001_schema.sql`) declares:
+
+```sql
+CREATE INDEX IF NOT EXISTS orders_sku_created_idx ON orders(sku, created_at DESC);
+CREATE INDEX IF NOT EXISTS orders_created_idx ON orders(created_at DESC);
 ```
+And `products.sku` is a primary key (`PRIMARY KEY (sku)`), giving $O(\log N)$ B-tree index lookup for the `JOIN` condition.
 
-to:
+---
 
-```text
-1 database command
-```
-
-### Step 3 - Add Indexes for the Access Pattern
-
-Indexes in this phase:
-
-```text
-orders:   { sku: 1, createdAt: -1 }
-orders:   { createdAt: -1 }
-orders:   { status: 1, createdAt: -1 }
-products: { sku: 1 } unique
-```
-
-The important `$lookup` index is `products.sku`. Without it, MongoDB has to work too hard to match product rows.
-
-### Step 4 - Prove the Query Shape Changed
-
-Broken endpoint response:
-
-```json
-{
-  "queryShape": "1 orders query + N product queries",
-  "totalMongoQueries": 31
-}
-```
-
-Fixed endpoint response:
-
-```json
-{
-  "queryShape": "1 aggregation pipeline with $lookup",
-  "totalMongoQueries": 1
-}
-```
-
-## Production-Grade Solution
-
-### Fixed Endpoint
+## Production-Grade Verification
 
 ```bash
-curl -s "$API_BASE/orders/with-products"
+curl -s http://localhost:3000/orders/with-products
 ```
 
 Expected response metadata:
-
 ```json
 {
-  "queryShape": "1 aggregation pipeline with $lookup",
+  "message": "Fixed: PostgreSQL query loads orders and product data in one database command.",
+  "queryShape": "1 SQL query with LEFT JOIN and json_build_object",
   "orderCount": 30,
   "productQueryCount": 0,
-  "totalMongoQueries": 1
+  "totalQueries": 1,
+  "indexesUsedByDesign": [
+    "orders: orders_sku_created_idx (sku, created_at DESC)",
+    "products: products_pkey (sku) unique"
+  ]
 }
 ```
 
-### Why It Works Under Scale
+---
 
-- The NestJS process sends one database command instead of issuing product lookups in a loop.
-- MongoDB performs the join-like work close to the data.
-- The result is capped with `$limit`.
-- `$project` avoids returning entire product documents.
-- Indexes support the sort/filter and product lookup.
+## Interview Questions & Staff-Level Answers
 
-### When Aggregation Is Not Enough
+### 1. What is the fundamental cause of the N+1 query problem?
+The N+1 problem occurs when an application fetches a collection of parent entities with 1 query, and then issues $N$ subsequent individual queries across the network to retrieve related child entities for each parent item (typically within an ORM loop or un-batched service call).
 
-If this dashboard becomes extremely hot, a further production step may denormalize a product snapshot into each order:
+### 2. Why is N+1 worse in distributed/microservice architectures than on a local database?
+Locally, network latency is sub-millisecond, masking the inefficiency. In production (where database or services communicate across VPC networks or availability zones with 1–5ms latency), 100 queries generate 100–500ms of pure idle network waiting time, holding connection pool threads hostage and degrading total API throughput.
 
-```text
-order.productSnapshot.name
-order.productSnapshot.priceCents
-```
+### 3. How does SQL `LEFT JOIN` with `json_build_object` compare to ORM eager loading or DataLoader?
+- **SQL JOIN + `json_build_object`:** Executes in a single database round trip and delegates relational assembly directly to PostgreSQL's C engine. Zero ORM memory overhead.
+- **DataLoader (Batching):** Executes 2 queries (1 for parent rows, 1 for all child IDs via `WHERE id = ANY(...)`) and stitches them in Node.js memory. Best suited for GraphQL where dynamic fields cannot be known ahead of time.
+- **ORM Eager Loading (`include`/`relations`):** Often produces Cartesian products if multiple collections are joined, or silently falls back to multiple un-batched queries if misconfigured.
 
-That avoids `$lookup`, but introduces a new tradeoff: product changes no longer automatically appear on historical orders. For order history, that is often correct; for live catalog views, it may not be.
-
-## Codex Documentation
-
-### Concept Explanation
-
-The N+1 query problem happens when one query fetches a parent list, then the application performs one extra query for each item in that list.
-
-```text
-1 query for N orders
-N queries for each order's product
-```
-
-The danger is that the endpoint's database work grows with result size.
-
-### Architecture Diagram
-
-Broken:
-
-```text
-NestJS
-  |
-  | 1 query
-  v
-MongoDB orders
-  |
-  | N queries from a loop
-  v
-MongoDB products
-```
-
-Fixed:
-
-```text
-NestJS
-  |
-  | 1 aggregation command
-  v
-MongoDB orders
-  |
-  | $lookup by indexed sku
-  v
-MongoDB products
-```
-
-### Tradeoffs
-
-- Application loops are easy to write, but hide query amplification.
-- Aggregation pipelines are more explicit and can be harder to read at first.
-- `$lookup` is powerful, but still needs indexes and careful projection.
-- Denormalization can avoid joins, but creates synchronization complexity.
-- Aggregation centralizes data work in MongoDB; that is good for round trips, but very large pipelines still need profiling.
-
-### When NOT to Use This Broken Approach
-
-Do not fetch related data one row at a time for:
-
-- Dashboards.
-- Admin tables.
-- Reports.
-- Export endpoints.
-- Feed APIs.
-- Any endpoint with pagination or bulk reads.
-
-### Interview Questions
-
-1. What is the N+1 query problem?
-2. Why does it often pass local testing?
-3. How can MongoDB aggregation reduce round trips?
-4. What indexes matter for `$lookup` by `sku`?
-5. When would you denormalize product data into orders instead?
-6. Why should `$limit` happen before `$lookup` for dashboard pages?
-7. What fields should you project out of the product document?
-8. How would you compare the broken and fixed endpoints in production telemetry?
-9. When can `$lookup` become a bottleneck?
-10. Why might historical orders store a product snapshot?
+### 4. How do you analyze whether your JOIN is hitting the index in PostgreSQL?
+By running `EXPLAIN (ANALYZE, BUFFERS)` on the query. Look for:
+- `Index Scan` or `Bitmap Index Scan` instead of `Seq Scan` (sequential table scan).
+- `Hash Join` or `Merge Join` for joining indexed sets.
+- `Buffers: shared hit` indicating data was read directly from PostgreSQL's shared buffer cache without disk I/O.

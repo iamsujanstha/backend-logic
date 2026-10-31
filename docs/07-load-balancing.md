@@ -119,7 +119,7 @@ Answers:
 1. With one container, all requests hit the same process, so local memory looks consistent.
 2. With multiple containers, each process has its own memory and its own counter.
 3. No. Sticky sessions can be useful for specific legacy or connection-oriented workloads, but they should not be the default fix for shared state.
-4. Shared mutable state should live in shared infrastructure: Redis for fast ephemeral counters/session-like state, MongoDB for durable business state, or another purpose-built store.
+4. Shared mutable state should live in shared infrastructure: Redis for fast ephemeral counters/session-like state, PostgreSQL for durable business state, or another purpose-built store.
 5. `X-Upstream-Address`, `X-Request-Id`, app `instanceId`, container logs, and Nginx access logs help correlate which upstream handled each request.
 
 ## Step-by-Step Fix
@@ -230,7 +230,7 @@ The better backend design is stateless app containers with shared external state
 
 Load balancing spreads requests across app instances. That is good for capacity and availability, but it breaks assumptions about local memory.
 
-If state must be shared across requests or instances, it should live in shared infrastructure such as Redis, MongoDB, or another durable service.
+If state must be shared across requests or instances, it should live in shared infrastructure such as Redis, PostgreSQL, or another durable service.
 
 ### Architecture Diagram
 
@@ -270,9 +270,9 @@ app A                app B
 - Process memory is fast, but not shared.
 - Sticky sessions reduce visible inconsistency, but hide statelessness problems.
 - Redis gives shared atomic counters, but adds network and operational dependency.
-- MongoDB gives durable state, but may be too heavy for high-frequency counters.
+- PostgreSQL gives durable state, but may be too heavy for high-frequency counters.
 - Redis counters are fast and atomic, but need persistence/backup decisions if the value is business-critical.
-- Durable counters may belong in MongoDB or an event stream depending on audit requirements.
+- Durable counters may belong in PostgreSQL or an event stream depending on audit requirements.
 
 ### When NOT to Use This Broken Approach
 
@@ -293,7 +293,7 @@ Do not store shared mutable state in app memory for:
 4. How do you debug which upstream handled a request?
 5. What shared stores are appropriate for counters?
 6. Why is Redis `INCR` safer than read-modify-write in app code?
-7. When should a counter be stored in MongoDB instead of Redis?
+7. When should a counter be stored in PostgreSQL instead of Redis?
 8. What happens during Redis failover?
 9. How would you correlate Nginx logs and app logs?
 10. Why do load-balanced bugs often disappear in local development?

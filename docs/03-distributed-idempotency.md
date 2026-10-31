@@ -105,7 +105,7 @@ Expected failure signals:
 - More than one request can succeed with the same idempotency key.
 - Responses may show different `instanceId` values.
 - The lock appears to work only when duplicates hit the same process at the same time.
-- Nothing durable is written to MongoDB for this broken endpoint.
+- Nothing durable is written to PostgreSQL for this broken endpoint.
 
 ## Think
 
@@ -114,7 +114,7 @@ Before we fix it:
 1. Why did the `Set` seem to solve the problem in local development?
 2. Why does it fail behind Nginx with multiple app containers?
 3. What happens to this lock during process restart or deploy?
-4. Why is a Redis lock still not enough without a MongoDB idempotency record?
+4. Why is a Redis lock still not enough without a PostgreSQL idempotency record?
 5. What should a duplicate retry receive after the first request succeeds?
 
 ## Step-by-Step Fix
@@ -140,22 +140,22 @@ Why this helps:
 - `PX` gives the lock an automatic expiry.
 - The random token prevents one request from releasing another request's lock.
 
-### Step 2 - Keep Durable Idempotency in MongoDB
+### Step 2 - Keep Durable Idempotency in PostgreSQL
 
 Redis locks are temporary. They are not the historical source of truth.
 
-The fixed route stores a durable payment record in MongoDB with:
+The fixed route stores a durable payment record in PostgreSQL (`payments` table) with:
 
 ```text
-idempotencyKey unique
-orderId unique
-requestHash
+idempotency_key UNIQUE
+order_id UNIQUE
+request_hash
 status processing | succeeded | failed
-responsePayload
-gatewayChargeId
+response_payload jsonb
+gateway_charge_id
 ```
 
-The unique index is the final correctness boundary. Even if two app instances race, MongoDB refuses duplicate durable records.
+The unique index is the final correctness boundary. Even if two app instances race, PostgreSQL refuses duplicate durable records with SQLSTATE `23505`.
 
 ### Step 3 - Store and Validate a Request Hash
 
@@ -200,7 +200,7 @@ That is the client contract. A mobile app can retry after a timeout without char
 ```text
 process-local Set         unsafe across instances
 Redis lock                useful in-flight coordination
-MongoDB unique index      durable correctness boundary
+PostgreSQL unique index   durable correctness boundary (SQLSTATE 23505)
 stored response replay    client-safe retry contract
 request hash              prevents key reuse with different payloads
 ```
@@ -241,18 +241,12 @@ Expected behavior:
 - One request creates the payment.
 - In-flight duplicates may receive `409 Conflict`.
 - Later retries receive `"replayed": true`.
-- MongoDB contains one durable payment for the key.
+- PostgreSQL contains one durable payment for the key.
 
-Inspect MongoDB:
+Inspect PostgreSQL:
 
 ```bash
-docker compose exec mongo mongosh backend_mastery --eval 'db.payments.find({idempotencyKey:"dist_demo_fixed_001"}).pretty()'
-```
-
-If you are using the transaction replica-set override from Phase 2, connect through its port:
-
-```text
-mongodb://localhost:27018/backend_mastery?replicaSet=rs0&retryWrites=false
+docker compose exec postgres psql -U backend -d backend_mastery -c "SELECT id, idempotency_key, order_id, status FROM payments WHERE idempotency_key = 'dist_demo_fixed_001';"
 ```
 
 ### Different Payload Reuse Simulation
@@ -293,7 +287,7 @@ Production idempotency has two time horizons:
 - In-flight: prevent two instances from doing the expensive side effect at the same time.
 - Historical: remember what happened so retries get the same answer later.
 
-Redis is good at the first. MongoDB is good at the second.
+Redis is good at the first. PostgreSQL is good at the second.
 
 ### Architecture Diagram
 
@@ -333,7 +327,7 @@ Client retries same payment
           Redis SET NX in-flight lock
                      |
                      v
-       MongoDB unique idempotency record
+       PostgreSQL unique idempotency record
                      |
                      v
           stored response is replayed
@@ -343,7 +337,7 @@ Client retries same payment
 
 - Local memory is fast, but invisible to other instances.
 - Redis is shared and fast, but locks are temporary.
-- MongoDB is durable, but should not be used as a spin lock.
+- PostgreSQL is durable, but should not be used as a spin lock.
 - A production design usually combines a short-lived distributed lock with a durable idempotency record.
 - Request hashes add safety, but require careful canonicalization so equivalent payloads hash the same way.
 - Returning `409` for in-flight duplicates is simple; some APIs choose `202 Accepted` with polling instead.

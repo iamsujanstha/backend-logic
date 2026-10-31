@@ -1,37 +1,46 @@
-# 01 - Idempotency Failure in Multi-Instance Payments
+# 01 — Idempotency Failure in Multi-Instance Payments
 
 ## Phase Status
 
 This phase contains both the broken implementation and the production-grade fix. Run the broken endpoint first, reason about the failure, then compare it with the durable implementation.
 
-## Updated Folder Structure
+## Folder Structure
 
 ```text
 src/
   app.module.ts
+  database/
+    database.module.ts       <-- Native pg Pool (PG_POOL token)
   payment/
-    broken-payment.store.ts
+    broken-payment.store.ts  <-- In-memory Map (demonstrates process-local flaw)
     dto/
       create-broken-payment.dto.ts
+      create-payment.dto.ts
     payment.controller.ts
     payment.module.ts
     payment-record.ts
-    payment.schema.ts
-    payment.service.ts
-    redis-lock.service.ts
-docker-compose.yml
-nginx.conf
+    payment.service.ts       <-- Raw PostgreSQL + Redis coordination
+    redis-lock.service.ts    <-- Distributed lock via SET NX PX
+db/
+  init/
+    001_schema.sql           <-- payments table with UNIQUE constraints
+docker-compose.yml           <-- PostgreSQL 17 + Redis 7 + App
+nginx.conf                   <-- Reverse proxy simulating multi-instance traffic
 docs/
   01-idempotency.md
 ```
+
+---
 
 ## Problem Scenario
 
 A customer taps "Pay" in a mobile app. The network times out before the client receives the response, so the app retries the same payment request with the same `Idempotency-Key`.
 
-In production, the NestJS API runs behind Nginx with multiple app instances. Request one lands on container A, and the retry lands on container B. If each instance only checks local memory, both containers believe they are processing the first payment and both call the payment gateway.
+In production, the NestJS API runs behind Nginx with multiple app instances. Request 1 lands on container A, and the retry lands on container B. If each instance only checks local memory, both containers believe they are processing the first payment and both call the payment gateway.
 
-Real outcome: duplicate charge, angry customer, manual refund, broken trust.
+**Real outcome:** Duplicate credit card charge, angry customer, manual refund fees, broken user trust.
+
+---
 
 ## Broken Implementation (Code)
 
@@ -41,9 +50,7 @@ The broken endpoint is:
 POST /payments/broken/charge
 Idempotency-Key: pay_demo_001
 Content-Type: application/json
-```
 
-```json
 {
   "userId": "user_123",
   "orderId": "order_9001",
@@ -52,366 +59,222 @@ Content-Type: application/json
 }
 ```
 
-The intentional flaw lives in:
+The intentional flaw lives in `src/payment/broken-payment.store.ts` and `src/payment/payment.service.ts`:
 
-```text
-src/payment/broken-payment.store.ts
-src/payment/payment.service.ts
-src/payment/payment.controller.ts
+```ts
+// Flaw 1: Check-then-act race condition in process memory
+const existingPayment = await this.brokenPaymentStore.findByOrderId(paymentRequest.orderId);
+if (existingPayment) {
+  return { payment: existingPayment, replayed: true };
+}
+
+// Flaw 2: Gateway delay widens the race window
+await this.simulateSlowPaymentGateway();
+
+// Flaw 3: In-memory JavaScript array/Map is isolated to this single Node process
+const payment = await this.brokenPaymentStore.create({ ... });
 ```
 
-The broken flow is:
+### Why the Broken Version Fails
+1. **Check-then-act race:** Two concurrent requests both execute `findByOrderId()` before either has written. Both see "nothing exists" and proceed to charge.
+2. **Gateway latency widens vulnerability:** The 250ms simulated gateway roundtrip leaves a massive window for concurrent retries to enter the critical section.
+3. **Process-isolated memory:** Process memory is isolated per container. Instance A cannot see the in-flight or completed payment stored inside instance B.
+4. **Disappears on restart:** An in-memory store is wiped on process restart, deployment, or crash.
 
-```text
-Client
-  |
-  | POST /payments/broken/charge
-  v
-Nginx
-  |
-  | load balances
-  v
-NestJS instance A or B
-  |
-  | checks process-local memory by orderId
-  | waits 250ms to simulate payment gateway latency
-  | inserts a charged payment into process-local memory
-  v
-Response
-```
+---
 
-The code accepts an `Idempotency-Key`, but it does not enforce it. That is worse than not having idempotency at all because the API looks safer than it is.
+## Step-by-Step Fix (Production Architecture)
 
-## Failure Simulation
-
-Start the system behind Nginx:
-
-```bash
-docker compose up --build --scale app=2
-```
-
-Send concurrent requests with the same `orderId` and same `Idempotency-Key`:
-
-```bash
-for i in 1 2 3 4 5; do
-  curl -s -X POST http://localhost:8000/payments/broken/charge \
-    -H 'Content-Type: application/json' \
-    -H 'Idempotency-Key: pay_demo_001' \
-    -d '{"userId":"user_123","orderId":"order_9001","amount":4999,"currency":"USD"}' &
-done
-wait
-```
-
-Then inspect what each instance remembers:
-
-```bash
-curl -s http://localhost:8000/payments/broken
-```
-
-Run the list request several times. Because the storage is process-local, Nginx may show different data depending on which container receives the request.
-
-Expected failure signals:
-
-- More than one successful charge for the same logical order.
-- Different responses from different app instances.
-- The response includes the same received idempotency key, but no durable idempotency decision was made.
-
-## Think
-
-Before we fix it:
-
-1. What exactly is wrong with checking `findByOrderId()` before creating the charge?
-2. Why does the 250ms gateway delay make the duplicate easier to reproduce?
-3. Why does process-local memory fail harder when Nginx spreads traffic across multiple containers?
-4. Would adding a simple JavaScript `Map` keyed by `Idempotency-Key` solve this in production?
-
-Answers:
-
-1. `findByOrderId()` followed by create is a check-then-act race. Two requests can both observe "nothing exists" before either one writes.
-2. The gateway delay widens the race window. While request A is waiting on the external provider, request B can enter the same code path.
-3. Process-local memory is isolated per container. Instance A cannot see the in-flight or completed payment stored inside instance B.
-4. A JavaScript `Map` only helps inside one process. It fails across replicas, restarts, deploys, and crashes.
-
-## Step-by-Step Fix
-
-### Step 1 - Require an Idempotency Key
-
+### Step 1 — Require an Operation Identity (`Idempotency-Key`)
 The production endpoint rejects payment creation without the header:
-
 ```http
 POST /payments/charge
 Idempotency-Key: pay_demo_001
 ```
+For non-idempotent mutations, the client must provide a stable operation identity. The server cannot safely guess whether two requests are the same based on payload shape alone.
 
-Why: for non-idempotent operations, the client must provide a stable operation identity. The server cannot reliably infer that two requests are the same just because the payload looks similar.
+### Step 2 — Store Durable Idempotency in PostgreSQL (Zero ORM)
+The schema in `db/init/001_schema.sql`:
 
-### Step 2 - Store the Idempotency Decision in MongoDB
-
-The durable schema lives in:
-
-```text
-src/payment/payment.schema.ts
+```sql
+CREATE TABLE IF NOT EXISTS payments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  idempotency_key text NOT NULL UNIQUE,
+  request_hash text NOT NULL,
+  order_id text NOT NULL UNIQUE,
+  user_id text NOT NULL,
+  amount integer NOT NULL CHECK (amount > 0),
+  currency char(3) NOT NULL,
+  status text NOT NULL CHECK (status IN ('processing', 'succeeded', 'failed')),
+  gateway_charge_id text,
+  response_payload jsonb,
+  failure_reason text,
+  instance_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 ```
 
-Important fields:
+Important columns:
+- `idempotency_key UNIQUE`: Enforces database-level uniqueness across all API instances.
+- `request_hash`: SHA-256 hash of the canonical request payload to prevent payload tampering under the same key.
+- `status`: State machine: `processing` ➔ `succeeded` or `failed`.
+- `response_payload jsonb`: Full cached API response payload for immediate replay.
 
+### Step 3 — PostgreSQL Unique Constraints as the Final Defense
+Application checks are optimizations for the happy path. The database engine's **B-tree unique index** is the authoritative correctness boundary.
+
+When concurrent requests race past application checks:
+1. One request succeeds and inserts.
+2. The concurrent request fails with **SQLSTATE `23505`** (`unique_violation`).
+3. The application catches `23505`, checks if the payment completed, and returns the stored response without charging twice:
+   ```ts
+   private isDuplicateKeyError(error: unknown): boolean {
+     return typeof error === 'object' && error !== null && 'code' in error && error.code === '23505';
+   }
+   ```
+
+### Step 4 — Coordinate In-Flight Requests with Redis Locks
+To prevent two requests from charging the external payment gateway simultaneously:
 ```text
-idempotencyKey unique
-orderId unique
-status processing | succeeded | failed
-responsePayload
-gatewayChargeId
-instanceId
+SET locks:payments:idempotency:{idempotencyKey} {token} PX 10000 NX
 ```
+- `NX`: Only set the key if it does not already exist (mutual exclusion).
+- `PX 10000`: Expire in 10,000ms automatically (prevents deadlocks if the node dies).
+- `token`: Unique UUID so only the owner can delete the lock via Lua script:
+  ```lua
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+  ```
 
-Why: the result must survive process restart and must be visible to every app instance.
-
-### Step 3 - Add MongoDB Unique Indexes
-
-The schema declares unique indexes on:
-
-```text
-idempotencyKey
-orderId
-```
-
-The application still checks for existing records, but the database owns final correctness. Application checks are useful for fast paths; unique indexes are correctness boundaries.
-
-### Step 4 - Coordinate In-Flight Requests with Redis
-
-The Redis lock service uses:
-
-```text
-SET key token PX ttl NX
-```
-
-Meaning:
-
-- `NX`: only create the lock if it does not exist.
-- `PX`: expire it automatically in milliseconds.
-- `token`: release only the lock this request owns.
-
-The release script checks the token before deleting the key so one request cannot accidentally release another request's lock.
-
-### Step 5 - Replay the First Successful Response
-
-When a request with the same idempotency key arrives after success, the API returns the stored response:
-
+### Step 5 — Replay the First Successful Response
+When a retry arrives after success, the API fetches `response_payload` directly from PostgreSQL:
 ```json
 {
   "replayed": true,
   "payment": {
+    "id": "7f093fb1-77ec-44f2-a279-91caeb5e2ff7",
     "orderId": "order_9001",
-    "status": "succeeded"
+    "status": "succeeded",
+    "gatewayChargeId": "gw_b3a726ef-..."
   }
 }
 ```
 
-This is what makes client retries safe. The client can retry after a timeout without guessing whether the first request succeeded.
+---
 
-### Step 6 - Keep the Broken Endpoint
+## Production-Grade Solution Flow
 
-The broken endpoint remains available:
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Nginx as Nginx Proxy
+    participant App as NestJS App
+    participant Redis as Redis (Coordination)
+    participant PG as PostgreSQL (Durable Truth)
+    participant GW as Payment Gateway
 
-```text
-POST /payments/broken/charge
+    Client->>Nginx: POST /payments/charge (Idempotency-Key)
+    Nginx->>App: Forward to available instance
+    App->>PG: SELECT * FROM payments WHERE idempotency_key = $1
+    alt Already succeeded
+        PG-->>App: Return record (status='succeeded')
+        App-->>Client: 200 OK (replayed: true, response_payload)
+    else In progress
+        PG-->>App: Return record (status='processing')
+        App-->>Client: 409 Conflict ("Payment in progress. Retry shortly.")
+    else Not found
+        App->>Redis: SET locks:idempotency:{key} {token} NX PX 10000
+        alt Lock failed (another instance grabbed it)
+            App-->>Client: 409 Conflict ("Payment in progress.")
+        else Lock acquired
+            App->>PG: INSERT INTO payments (status='processing')
+            App->>GW: Call external gateway (charge card)
+            GW-->>App: charge_id: "gw_123"
+            App->>PG: UPDATE payments SET status='succeeded', gateway_charge_id='gw_123', response_payload={...}
+            App->>Redis: DEL lock (via Lua script with token)
+            App-->>Client: 200 OK (replayed: false, payment payload)
+        end
+    end
 ```
 
-The production endpoint is:
+---
 
-```text
-POST /payments/charge
-```
+## How to Test and Verify
 
-Keeping both endpoints makes the failure measurable instead of theoretical.
-
-## Production-Grade Solution
-
-### Request Flow
-
-```text
-Client
-  |
-  | POST /payments/charge
-  | Idempotency-Key: pay_demo_001
-  v
-Nginx
-  |
-  | load balances to any app instance
-  v
-NestJS PaymentService
-  |
-  | 1. read MongoDB by idempotencyKey
-  | 2. replay stored success if present
-  | 3. acquire Redis SET NX lock
-  | 4. check MongoDB again after lock
-  | 5. insert processing payment record
-  | 6. call payment gateway
-  | 7. update MongoDB with succeeded response
-  | 8. release Redis lock
-  v
-Client receives first response or replay
-```
-
-### Why It Works Under Scale
-
-- Nginx can send retries to any container because the idempotency decision is stored in MongoDB.
-- Redis protects the in-flight window where no durable success response exists yet.
-- MongoDB unique indexes protect correctness if two app instances race or the Redis lock expires early.
-- The stored response lets clients safely retry after timeouts.
-
-### Fixed Endpoint Simulation
-
-Start all services:
-
+### 1. Launch Docker Compose
 ```bash
-docker compose up --build --scale app=2
+docker compose up -d
 ```
 
-Send concurrent duplicate requests:
-
+### 2. Send 5 Concurrent Duplicate Requests
 ```bash
-for i in 1 2 3 4 5; do
-  curl -s -X POST http://localhost:8000/payments/charge \
+for i in {1..5}; do
+  curl -s -X POST http://localhost:3000/payments/charge \
     -H 'Content-Type: application/json' \
-    -H 'Idempotency-Key: pay_demo_001' \
+    -H 'Idempotency-Key: pay_live_test_001' \
     -d '{"userId":"user_123","orderId":"order_9001","amount":4999,"currency":"USD"}' &
 done
 wait
 ```
 
-Inspect durable payments:
+### 3. Observe the Outcome
+- **1 request** acquires the lock, charges the gateway, and returns HTTP 200 (`"replayed": false`).
+- **Concurrent requests** receive HTTP 409 Conflict (`"Payment is already being processed. Retry shortly."`).
+- **Subsequent retries** with the same key immediately return HTTP 200 with `"replayed": true` and the exact cached payload.
 
+### 4. Direct PostgreSQL Verification
 ```bash
-curl -s http://localhost:8000/payments
+docker exec -it backend-logic-postgres-1 psql -U backend -d backend_mastery \
+  -c "SELECT id, idempotency_key, order_id, status, gateway_charge_id FROM payments;"
 ```
+Output confirms: **exactly 1 row exists.**
 
-Expected fixed behavior:
+---
 
-- Only one MongoDB payment document for `pay_demo_001`.
-- Only one gateway charge id.
-- Duplicate in-flight requests receive `409 Conflict`.
-- Later retries receive the stored success response with `"replayed": true`.
+## Interview Questions & Staff-Level Answers
 
-### Docker and Nginx Integration
+### 1. What is the difference between idempotency and locking?
+* **Locking** coordinates concurrent execution over a short time window to protect a critical section. A lock is ephemeral and is released once processing finishes.
+* **Idempotency** guarantees that executing an operation multiple times produces the exact same business outcome as executing it once. Idempotency is durable and persists indefinitely after the lock is released.
 
-`docker-compose.yml` now includes:
+### 2. Why is `check-then-insert` unsafe under concurrent requests?
+Because `check-then-insert` is non-atomic. Between the `SELECT` query and the subsequent `INSERT` statement, context switching, network latency, or concurrency allows multiple threads/processes to execute the `SELECT`, see no conflicting record, and proceed to `INSERT`. Only a database-level unique constraint (`UNIQUE` index) or an atomic upsert (`INSERT ... ON CONFLICT`) guarantees mutual exclusion at the storage engine level.
 
-```text
-proxy -> Nginx on localhost:8000
-app -> scalable NestJS service
-mongo -> MongoDB durable state
-redis -> distributed in-flight coordination
-```
+### 3. How does a database unique index protect correctness differently from application code?
+Application code operates in memory and across distributed processes where state is fragmented and susceptible to race conditions. A database unique index is enforced directly by the storage engine's B-Tree data structure and page-level locks within the database engine's Write-Ahead Log (WAL). If two transactions attempt to insert the same value concurrently, the database serializes index page updates and forces the second transaction to abort with SQLSTATE `23505`.
 
-`nginx.conf` adds:
+### 4. What should an API return when the same idempotency key is retried after success?
+The API must return the exact HTTP status code and response payload that was returned upon the initial successful completion, accompanied by a header or attribute indicating it is a replayed response (e.g. `replayed: true` or `Idempotent-Replay: true`). The client should receive the same payload without any secondary side-effects occurring downstream.
 
-```text
-X-Upstream-Address
-```
+### 5. What should happen when a duplicate request arrives while the first request is still in progress?
+The server should return **HTTP 409 Conflict** (or HTTP 425 Too Early) with a header such as `Retry-After: 2`. The client must not trigger a second execution or mutate state while the first execution holds the active processing lease.
 
-Use that header to see which upstream handled a response. The app response also includes `instanceId`.
+### 6. Why should the idempotency response payload be stored durably?
+If the response payload is not stored durably, a client retrying after a network timeout cannot be served the original response. If the server only remembers that the operation succeeded, it might have to re-query multiple tables or synthesize a response, which risks returning inconsistent data if subsequent mutations have already modified those entities.
 
-## Codex Documentation
+### 7. What can go wrong if the Redis lock expires before the payment gateway returns?
+If the lock TTL expires while the payment gateway call is still in flight (e.g. due to gateway latency or a GC pause):
+1. The lock is released automatically.
+2. A concurrent retry acquires the now-free lock.
+3. The second request calls the payment gateway, causing a **duplicate charge**.
+**Defense:** The database unique constraint on `order_id` / `idempotency_key` will prevent the second request from saving a duplicate record, but money has already been deducted at the gateway. Therefore, the lock TTL must exceed the maximum gateway timeout, and gateway requests must include the provider's native idempotency key.
 
-### Concept Explanation
+### 8. How would you detect and repair a payment charged at the gateway but stuck as `processing` in PostgreSQL?
+Via an asynchronous **Reconciliation Sweeper**:
+1. A cron job queries PostgreSQL for payments where `status = 'processing' AND created_at < now() - interval '5 minutes'`.
+2. For each stuck payment, the worker queries the payment gateway's API using the `orderId` or `idempotencyKey`.
+3. If the gateway confirms the charge succeeded, update PostgreSQL to `succeeded` with the gateway charge ID.
+4. If the gateway confirms no charge was made, mark the record as `failed` so the customer can retry.
 
-Idempotency means the same logical operation can be safely repeated without changing the final result more than once. For payments, retries are normal because clients, gateways, and networks fail. The backend must treat retries as expected behavior, not exceptional behavior.
+### 9. Should the same idempotency key be accepted with a different request body?
+**No. It must be rejected with HTTP 422 Unprocessable Entity or HTTP 409 Conflict.** 
+Reusing an idempotency key with different parameters (e.g., changing the amount from \$50 to \$500) indicates either a client-side programming bug or a malicious replay attempt. In our implementation, we hash the canonical request payload with SHA-256 (`request_hash`) and verify that incoming retries match the stored hash before replaying.
 
-Idempotency is not the same as locking:
-
-- Idempotency defines the externally visible behavior for duplicate logical operations.
-- Locking coordinates concurrent execution for a short time window.
-- Unique indexes enforce durable correctness after all application-level defenses fail.
-
-### Architecture Diagram
-
-```text
-Client retry with Idempotency-Key
-        |
-        v
-      Nginx
-        |
-        +----------+----------+
-        |                     |
-        v                     v
-  Nest instance A       Nest instance B
-        |                     |
-        |   broken: local memory only
-        v                     v
-  duplicate charge      duplicate charge
-```
-
-Fixed:
-
-```text
-Client retry with Idempotency-Key
-        |
-        v
-      Nginx
-        |
-        +----------+----------+
-        |                     |
-        v                     v
-  Nest instance A       Nest instance B
-        |                     |
-        +----------+----------+
-                   |
-                   v
-        Redis lock for in-flight work
-                   |
-                   v
-      MongoDB unique idempotency record
-                   |
-                   v
-       one gateway charge, replayed result
-```
-
-### Tradeoffs
-
-- Process-local memory is fast, but disappears on restart and cannot coordinate multiple instances.
-- Checking before insert is easy to understand, but unsafe under concurrency.
-- Accepting idempotency headers without enforcing them creates a false safety contract.
-- Redis locks are fast and practical, but they must have TTLs and safe token-based release.
-- MongoDB unique indexes are a strong correctness boundary, but duplicate-key errors must be handled as normal control flow.
-- Storing full response payloads improves replay behavior, but payload shape becomes part of the API contract.
-
-### Failure Modes to Design For
-
-- Redis is temporarily unavailable: for payment writes, fail closed or rely on a database-only atomic insert path. Do not silently charge without coordination.
-- The app crashes after gateway charge but before MongoDB update: production systems need reconciliation with the payment provider.
-- The lock TTL is too short: a second request may start while the first gateway call is still running. The MongoDB unique index remains the final defense.
-- The client reuses one idempotency key with a different payload: production systems should store a request hash and reject mismatched retries.
-
-### When NOT to Use This Approach
-
-Do not use process-local idempotency for:
-
-- Payments.
-- Inventory reservation.
-- Order creation.
-- External API calls that charge money, send emails, ship products, or mutate third-party state.
-- Any endpoint served by more than one process or container.
-
-Do not use Redis-only idempotency for durable financial correctness. Redis is coordination, not the permanent source of truth.
-
-This exact implementation is also incomplete for regulated payment systems because it does not yet include:
-
-- Request payload hashing.
-- Gateway reconciliation jobs.
-- Permanent audit trails.
-- PII redaction and payment data compliance boundaries.
-- Transactional outbox events for notifications.
-
-### Interview Questions
-
-1. What is the difference between idempotency and locking?
-2. Why is `check-then-insert` unsafe under concurrent requests?
-3. How does a unique index protect correctness differently from application code?
-4. What should an API return when the same idempotency key is retried after success?
-5. What should happen when the first request is still in progress?
-6. Why should the idempotency response be stored durably?
-7. What can go wrong if the Redis lock expires before the payment gateway returns?
-8. How would you detect and repair a payment charged at the gateway but stuck as `processing` locally?
-9. Should the same idempotency key be accepted with a different request body?
-10. Why is "exactly once" usually the wrong phrase for distributed payment systems?
+### 10. Why is "exactly once" the wrong phrase for distributed payment systems?
+Because across an untrusted network with independent distributed nodes, true physical "exactly-once delivery" is mathematically impossible (the Two Generals' Problem). Packets drop, timeouts happen, and retries are mandatory. Production systems achieve **effectively exactly-once processing** through a combination of:
+1. **At-least-once delivery** (client and queue retries).
+2. **Idempotent consumption** (durable database constraints and deduplication tables).

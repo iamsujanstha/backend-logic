@@ -323,7 +323,7 @@ Redis / queue broker
 Worker containers: CPU or IO jobs, scaled separately
   |
   v
-MongoDB / object storage / downstream systems
+PostgreSQL / object storage / downstream systems
 ```
 
 Operational rules:

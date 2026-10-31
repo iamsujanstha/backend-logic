@@ -3,18 +3,32 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development # ◄ CRITICAL: Tells Docker to stop at the dev stage
-    # Command overrides the default to ensure NestJS runs in watch mode
+      target: development
     command: npm run start:dev
+    ports:
+      - "3000:3000"
     environment:
       - PORT=3000
       - DATABASE_URL=postgres://backend:backend@postgres:5432/backend_mastery
-      - REDIS_URL=${REDIS_URL}
+      - REDIS_URL=redis://redis:6379
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - shared-network
+    develop:
+      watch:
+        - path: ./src
+          action: sync
+          target: /app/src
+          ignore:
+            - node_modules/
+        - path: ./package.json
+          action: rebuild
+        - path: ./package-lock.json
+          action: rebuild
 
   postgres:
     image: postgres:17-alpine
@@ -27,7 +41,6 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro
-      - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U backend -d backend_mastery"]
       interval: 5s
@@ -36,19 +49,17 @@ services:
     networks:
       - shared-network
 
-    develop:
-      watch:
-        # Sync local changes into the container's /app/src folder
-        - path: ./src
-          action: sync
-          target: /app/src # ◄ Matches the WORKDIR /app in your Dockerfile
-          ignore:
-            - node_modules/
-
-        - path: ./package.json
-          action: rebuild
-        - path: ./package-lock.json
-          action: rebuild
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - shared-network
 
 networks:
   shared-network:

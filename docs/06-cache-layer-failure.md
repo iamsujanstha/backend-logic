@@ -22,9 +22,9 @@ docs/
 
 A product details endpoint is slow, so the team adds Redis caching. At first, latency improves.
 
-Then Redis restarts during deploy, hits max memory, loses network connectivity, or has a brief failover. Instead of falling back to MongoDB, the API fails because the implementation treats Redis as required infrastructure for reads.
+Then Redis restarts during deploy, hits max memory, loses network connectivity, or has a brief failover. Instead of falling back to PostgreSQL, the API fails because the implementation treats Redis as required infrastructure for reads.
 
-Real outcome: product pages go down even though MongoDB still has every product.
+Real outcome: product pages go down even though PostgreSQL still has every product.
 
 ## Broken Implementation (Code)
 
@@ -62,7 +62,7 @@ Redis GET cache:products:prod_n1_keyboard
   |
   +-- Redis down -> request fails
   |
-  +-- Redis miss -> return null even though MongoDB has product
+  +-- Redis miss -> return null even though PostgreSQL has product
 ```
 
 This is cache-as-source-of-truth, which is wrong for this product read.
@@ -108,8 +108,8 @@ curl -i "$API_BASE/products/broken/cache-only/prod_n1_keyboard"
 Expected failure signals:
 
 - The endpoint fails or hangs when Redis is unavailable.
-- A Redis miss returns `product: null` even if MongoDB contains the product.
-- MongoDB is never consulted by the broken endpoint.
+- A Redis miss returns `product: null` even if PostgreSQL contains the product.
+- PostgreSQL is never consulted by the broken endpoint.
 
 ## Think
 
@@ -118,15 +118,15 @@ Before we fix it:
 1. Should Redis be required for product reads?
 2. What is the true source of truth here?
 3. Why is returning `null` on cache miss dangerous?
-4. What should happen if Redis is down but MongoDB is healthy?
+4. What should happen if Redis is down but PostgreSQL is healthy?
 5. What timeout should a cache call have in production?
 
 Answers:
 
 1. No. Redis should not be required for this product read. It is an optimization layer.
-2. MongoDB is the source of truth. Redis stores temporary copies.
+2. PostgreSQL is the source of truth. Redis stores temporary copies.
 3. Returning `null` on cache miss lies to the caller. A cache miss means "not in cache", not "product does not exist".
-4. The API should read from MongoDB, return the product, and optionally repopulate Redis best-effort.
+4. The API should read from PostgreSQL, return the product, and optionally repopulate Redis best-effort.
 5. Cache calls should have short timeouts. In this demo the fixed endpoint uses `75ms`; real values depend on latency budgets and infrastructure.
 
 ## Step-by-Step Fix
@@ -146,9 +146,9 @@ try Redis
   |
   +-- hit -> return product
   |
-  +-- miss -> read MongoDB -> best-effort cache set -> return product
+  +-- miss -> read PostgreSQL -> best-effort cache set -> return product
   |
-  +-- failure/timeout -> read MongoDB -> best-effort cache set -> return product
+  +-- failure/timeout -> read PostgreSQL -> best-effort cache set -> return product
 ```
 
 ### Step 2 - Add Short Redis Timeouts
@@ -159,11 +159,11 @@ The fixed endpoint wraps Redis operations with a short timeout:
 75ms
 ```
 
-Why: cache should not consume the whole request latency budget. If Redis is slow, move on to MongoDB.
+Why: cache should not consume the whole request latency budget. If Redis is slow, move on to PostgreSQL.
 
 ### Step 3 - Repopulate Cache Best-Effort
 
-After MongoDB fallback, the service tries to write the product back to Redis:
+After PostgreSQL fallback, the service tries to write the product back to Redis:
 
 ```text
 set cache key with TTL 60 seconds
@@ -177,8 +177,8 @@ The fixed endpoint tells you where the data came from:
 
 ```text
 redis
-mongo-cache-miss
-mongo-cache-failure
+pg-cache-miss
+pg-cache-failure
 ```
 
 This is teaching metadata. In a production public API you might keep this in logs, traces, or debug headers instead of the response body.
@@ -193,7 +193,7 @@ Seed data:
 curl -s -X POST "$API_BASE/n-plus-one-demo/seed"
 ```
 
-First read. If cache is empty, expect MongoDB fallback:
+First read. If cache is empty, expect PostgreSQL fallback:
 
 ```bash
 curl -s "$API_BASE/products/prod_n1_keyboard"
@@ -203,7 +203,7 @@ Expected:
 
 ```json
 {
-  "source": "mongo-cache-miss",
+  "source": "pg-cache-miss",
   "cacheRepopulated": true
 }
 ```
@@ -238,7 +238,7 @@ Expected:
 
 ```json
 {
-  "source": "mongo-cache-failure",
+  "source": "pg-cache-failure",
   "cacheHealthy": false,
   "product": {
     "sku": "prod_n1_keyboard"
@@ -246,7 +246,7 @@ Expected:
 }
 ```
 
-The product read survives because MongoDB is still available.
+The product read survives because PostgreSQL is still available.
 
 ### Production Design
 
@@ -261,7 +261,7 @@ NestJS product endpoint
   +-- Redis miss/failure/timeout
           |
           v
-        MongoDB source of truth
+        PostgreSQL source of truth
           |
           v
         best-effort Redis set
@@ -274,7 +274,7 @@ Operational rules:
 - Add metrics for hit rate, miss rate, fallback rate, and Redis errors.
 - Use TTLs with jitter in high-traffic systems to avoid stampedes.
 - Consider stale-while-revalidate for read-heavy, tolerance-for-staleness data.
-- Protect MongoDB from cache stampedes with request coalescing or distributed locks for very hot keys.
+- Protect PostgreSQL from cache stampedes with request coalescing or distributed locks for very hot keys.
 
 ## Codex Documentation
 
@@ -282,7 +282,7 @@ Operational rules:
 
 A cache should usually improve latency or reduce load. It should not become the source of truth unless the system is explicitly designed that way.
 
-For product reads, MongoDB owns the data. Redis is a temporary acceleration layer.
+For product reads, PostgreSQL owns the data. Redis is a temporary acceleration layer.
 
 ### Architecture Diagram
 
@@ -313,7 +313,7 @@ NestJS
   +-- Redis miss/down
           |
           v
-        MongoDB
+        PostgreSQL
           |
           v
         product + best-effort cache set
@@ -322,17 +322,17 @@ NestJS
 ### Tradeoffs
 
 - Redis is fast, but volatile.
-- MongoDB is slower than cache, but durable.
+- PostgreSQL is slower than cache, but durable.
 - Cache-aside adds code paths, but makes cache outages survivable.
 - Serving stale cache can improve availability, but risks outdated data.
-- Short timeouts protect latency, but can increase MongoDB fallback traffic during Redis slowness.
+- Short timeouts protect latency, but can increase PostgreSQL fallback traffic during Redis slowness.
 - Best-effort cache writes keep the response path resilient, but failures need observability.
 
 ### When NOT to Use This Broken Approach
 
 Do not make Redis mandatory for:
 
-- Product details backed by MongoDB.
+- Product details backed by PostgreSQL.
 - User profile reads backed by a durable database.
 - Order history.
 - Admin dashboards.
