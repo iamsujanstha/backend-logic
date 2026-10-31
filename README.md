@@ -25,6 +25,10 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Backend learning lab
+
+See the [problem and solution reference](docs/README.md) for lessons 01–07 and their source files. Continue with [lesson 08: transactional outbox](docs/08-transactional-outbox.md), a broken-first exercise on reliably connecting committed orders to queued work.
+
 ## Project setup
 
 ```bash
